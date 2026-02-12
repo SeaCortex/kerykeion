@@ -248,7 +248,7 @@ AspectName: TypeAlias = Literal[
 ]
 """Literal type for all the available aspects names"""
 
-ReturnType: TypeAlias = Literal["Lunar", "Solar"]
+ReturnType: TypeAlias = Literal["Lunar", "Solar", "Saturn", "Jupiter", "MeanNode"]
 """Literal type for Return Types"""
 
 

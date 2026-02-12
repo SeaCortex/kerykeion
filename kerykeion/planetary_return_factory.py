@@ -87,6 +87,36 @@ from kerykeion.astrological_subject_factory import AstrologicalSubjectFactory
 from kerykeion.schemas.kr_literals import ReturnType
 from kerykeion.schemas.kr_models import PlanetReturnModel, AstrologicalSubjectModel
 
+RETURN_SOLAR = "Solar"
+RETURN_LUNAR = "Lunar"
+RETURN_SATURN = "Saturn"
+RETURN_JUPITER = "Jupiter"
+RETURN_MEAN_NODE = "MeanNode"
+
+GENERIC_RETURN_CONFIG: dict[str, dict[str, Union[int, float, str]]] = {
+    RETURN_SATURN: {
+        "point_attr": "saturn",
+        "swe_body": swe.SATURN,
+        "coarse_step_days": 45.0,
+        "max_scan_days": 365.0 * 40.0,
+    },
+    RETURN_JUPITER: {
+        "point_attr": "jupiter",
+        "swe_body": swe.JUPITER,
+        "coarse_step_days": 21.0,
+        "max_scan_days": 365.0 * 20.0,
+    },
+    RETURN_MEAN_NODE: {
+        "point_attr": "mean_north_lunar_node",
+        "swe_body": swe.MEAN_NODE,
+        "coarse_step_days": 21.0,
+        "max_scan_days": 365.0 * 25.0,
+    },
+}
+
+GENERIC_DELTA_NEAR_ZERO_EPS = 1e-6
+GENERIC_DELTA_DISCONTINUITY_GUARD = 150.0
+GENERIC_REFINE_TOLERANCE_DAYS = 1.0 / 86400.0
 
 class PlanetaryReturnFactory:
     """
@@ -391,6 +421,143 @@ class PlanetaryReturnFactory:
             self.lat = float(self.city_data["lat"])
             self.tz_str = self.city_data["timezonestr"]
 
+    @staticmethod
+    def _wrap180(value: float) -> float:
+        """Normalize an angular value in degrees to the range [-180, 180)."""
+        return ((value + 180.0) % 360.0) - 180.0
+
+    @staticmethod
+    def _body_longitude(julian_day: float, swe_body: int) -> float:
+        """Get geocentric ecliptic longitude for a Swiss Ephemeris body."""
+        return float(swe.calc_ut(julian_day, swe_body)[0][0] % 360.0)
+
+    @classmethod
+    def _is_safe_crossing(cls, left_delta: float, right_delta: float) -> bool:
+        if abs(left_delta) <= GENERIC_DELTA_NEAR_ZERO_EPS or abs(right_delta) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+            return True
+        if left_delta * right_delta > 0:
+            return False
+        return abs(left_delta) < GENERIC_DELTA_DISCONTINUITY_GUARD and abs(right_delta) < GENERIC_DELTA_DISCONTINUITY_GUARD
+
+    @classmethod
+    def _refine_crossing_bisection(
+        cls,
+        left_jd: float,
+        right_jd: float,
+        left_delta: float,
+        right_delta: float,
+        target_longitude: float,
+        swe_body: int,
+    ) -> float:
+        a = left_jd
+        b = right_jd
+        fa = left_delta
+        fb = right_delta
+
+        max_iterations = 80
+        for _ in range(max_iterations):
+            midpoint = (a + b) / 2.0
+            fm = cls._wrap180(cls._body_longitude(midpoint, swe_body) - target_longitude)
+
+            if abs(fm) <= GENERIC_DELTA_NEAR_ZERO_EPS or (b - a) <= GENERIC_REFINE_TOLERANCE_DAYS:
+                return midpoint
+
+            if cls._is_safe_crossing(fa, fm):
+                b = midpoint
+                fb = fm
+            else:
+                a = midpoint
+                fa = fm
+
+            if abs(fa) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+                return a
+            if abs(fb) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+                return b
+
+        return (a + b) / 2.0
+
+    @classmethod
+    def _next_generic_return_julian(
+        cls,
+        start_julian_day: float,
+        target_longitude: float,
+        swe_body: int,
+        coarse_step_days: float,
+        max_scan_days: float,
+    ) -> float:
+        def delta(jd: float) -> float:
+            return cls._wrap180(cls._body_longitude(jd, swe_body) - target_longitude)
+
+        current_jd = start_julian_day
+        current_delta = delta(current_jd)
+        if abs(current_delta) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+            return current_jd
+
+        best_jd = current_jd
+        best_abs_delta = abs(current_delta)
+        scan_steps = int(max_scan_days / coarse_step_days)
+
+        for _ in range(scan_steps):
+            next_jd = current_jd + coarse_step_days
+            next_delta = delta(next_jd)
+
+            abs_next_delta = abs(next_delta)
+            if abs_next_delta < best_abs_delta:
+                best_abs_delta = abs_next_delta
+                best_jd = next_jd
+
+            if abs(next_delta) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+                return next_jd
+
+            if cls._is_safe_crossing(current_delta, next_delta):
+                return cls._refine_crossing_bisection(
+                    left_jd=current_jd,
+                    right_jd=next_jd,
+                    left_delta=current_delta,
+                    right_delta=next_delta,
+                    target_longitude=target_longitude,
+                    swe_body=swe_body,
+                )
+
+            current_jd = next_jd
+            current_delta = next_delta
+
+        # Fallback local scan around the best absolute delta point.
+        fallback_half_window_days = coarse_step_days
+        fine_step_days = max(coarse_step_days / 64.0, 0.25)
+        left_jd = max(start_julian_day, best_jd - fallback_half_window_days)
+        right_jd = best_jd + fallback_half_window_days
+
+        probe_jd = left_jd
+        probe_delta = delta(probe_jd)
+        if abs(probe_delta) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+            return probe_jd
+
+        while probe_jd < right_jd:
+            next_probe_jd = min(probe_jd + fine_step_days, right_jd)
+            next_probe_delta = delta(next_probe_jd)
+
+            if abs(next_probe_delta) <= GENERIC_DELTA_NEAR_ZERO_EPS:
+                return next_probe_jd
+
+            if cls._is_safe_crossing(probe_delta, next_probe_delta):
+                return cls._refine_crossing_bisection(
+                    left_jd=probe_jd,
+                    right_jd=next_probe_jd,
+                    left_delta=probe_delta,
+                    right_delta=next_probe_delta,
+                    target_longitude=target_longitude,
+                    swe_body=swe_body,
+                )
+
+            probe_jd = next_probe_jd
+            probe_delta = next_probe_delta
+
+        if best_abs_delta <= 0.01:
+            return best_jd
+
+        raise KerykeionException("Unable to bracket planetary return within search range.")
+
     def next_return_from_iso_formatted_time(
         self, iso_formatted_time: str, return_type: ReturnType
     ) -> PlanetReturnModel:
@@ -486,11 +653,13 @@ class PlanetaryReturnFactory:
             next_return_from_date(): Date-based calculation interface
         """
 
-        date = datetime.fromisoformat(iso_formatted_time)
+        date = datetime.fromisoformat(iso_formatted_time.replace("Z", "+00:00"))
+        if date.tzinfo is not None:
+            date = date.astimezone(timezone.utc).replace(tzinfo=None)
         julian_day = datetime_to_julian(date)
 
         return_julian_date = None
-        if return_type == "Solar":
+        if return_type == RETURN_SOLAR:
             if self.subject.sun is None:
                 raise KerykeionException(
                     "Sun position is required for Solar return but is not available in the subject."
@@ -499,7 +668,7 @@ class PlanetaryReturnFactory:
                 self.subject.sun.abs_pos,
                 julian_day,
             )
-        elif return_type == "Lunar":
+        elif return_type == RETURN_LUNAR:
             if self.subject.moon is None:
                 raise KerykeionException(
                     "Moon position is required for Lunar return but is not available in the subject."
@@ -508,8 +677,26 @@ class PlanetaryReturnFactory:
                 self.subject.moon.abs_pos,
                 julian_day,
             )
+        elif return_type in GENERIC_RETURN_CONFIG:
+            config = GENERIC_RETURN_CONFIG[return_type]
+            point_attr = str(config["point_attr"])
+            target_point = getattr(self.subject, point_attr, None)
+            if target_point is None:
+                raise KerykeionException(
+                    f"{point_attr} position is required for {return_type} return but is not available in the subject."
+                )
+
+            return_julian_date = self._next_generic_return_julian(
+                start_julian_day=julian_day,
+                target_longitude=float(target_point.abs_pos),
+                swe_body=int(config["swe_body"]),
+                coarse_step_days=float(config["coarse_step_days"]),
+                max_scan_days=float(config["max_scan_days"]),
+            )
         else:
-            raise KerykeionException(f"Invalid return type {return_type}. Use 'Solar' or 'Lunar'.")
+            raise KerykeionException(
+                f"Invalid return type {return_type}. Use one of: {RETURN_SOLAR}, {RETURN_LUNAR}, {RETURN_SATURN}, {RETURN_JUPITER}, {RETURN_MEAN_NODE}."
+            )
 
         solar_return_date_utc = julian_to_datetime(return_julian_date)
         solar_return_date_utc = solar_return_date_utc.replace(tzinfo=timezone.utc)
